@@ -806,6 +806,17 @@ enum DatabaseImpl {
 }
 
 impl Database {
+    fn backend(&self) -> query::DbBackend {
+        match &*self.inner {
+            #[cfg(feature = "sqlite")]
+            DatabaseImpl::Sqlite(_) => query::DbBackend::Sqlite,
+            #[cfg(feature = "postgres")]
+            DatabaseImpl::Postgres(_) => query::DbBackend::Postgres,
+            #[cfg(feature = "mysql")]
+            DatabaseImpl::MySql(_) => query::DbBackend::MySql,
+        }
+    }
+
     /// Creates a new database connection. The connection string should be in
     /// the format of the database URL.
     ///
@@ -1330,7 +1341,7 @@ impl Database {
         let columns_to_get: Vec<_> = T::COLUMNS.iter().map(|column| column.name).collect();
         let mut select = sea_query::Query::select();
         select.columns(columns_to_get).from(T::TABLE_NAME);
-        query.add_filter_to_statement(&mut select);
+        query.add_filter_to_statement(&mut select, self.backend());
         query.add_limit_to_statement(&mut select);
         query.add_offset_to_statement(&mut select);
 
@@ -1356,7 +1367,7 @@ impl Database {
         let columns_to_get: Vec<_> = T::COLUMNS.iter().map(|column| column.name).collect();
         let mut select = sea_query::Query::select();
         select.columns(columns_to_get).from(T::TABLE_NAME);
-        query.add_filter_to_statement(&mut select);
+        query.add_filter_to_statement(&mut select, self.backend());
         select.limit(1);
 
         let row = self.fetch_option(&select).await?;
@@ -1382,7 +1393,7 @@ impl Database {
     pub async fn exists<T: Model>(&self, query: &Query<T>) -> Result<bool> {
         let mut select = sea_query::Query::select();
         select.expr(sea_query::Expr::value(1)).from(T::TABLE_NAME);
-        query.add_filter_to_statement(&mut select);
+        query.add_filter_to_statement(&mut select, self.backend());
         select.limit(1);
 
         let rows = self.fetch_option(&select).await?;
@@ -1404,7 +1415,7 @@ impl Database {
     pub async fn delete<T: Model>(&self, query: &Query<T>) -> Result<StatementResult> {
         let mut delete = sea_query::Query::delete();
         delete.from_table(T::TABLE_NAME);
-        query.add_filter_to_statement(&mut delete);
+        query.add_filter_to_statement(&mut delete, self.backend());
 
         self.execute_statement(&delete).await
     }

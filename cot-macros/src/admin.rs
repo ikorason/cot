@@ -42,14 +42,23 @@ impl AdminModelOpts {
         AdminModelDeriveBuilder {
             name: self.ident.clone(),
             primary_key: None,
+            search_fields: Vec::new(),
         }
     }
+}
+
+/// A field included in admin search, with a flag for whether it needs a TEXT cast.
+#[derive(Debug)]
+struct SearchField {
+    name: String,
+    needs_cast: bool,
 }
 
 #[derive(Debug)]
 struct AdminModelDeriveBuilder {
     name: syn::Ident,
     primary_key: Option<FieldOpts>,
+    search_fields: Vec<SearchField>,
 }
 
 impl ToTokens for AdminModelDeriveBuilder {
@@ -70,7 +79,24 @@ impl AdminModelDeriveBuilder {
     fn push_field(&mut self, field: &FieldOpts) {
         if field.primary_key.is_present() {
             self.primary_key = Some(field.clone());
+            return; // primary keys excluded from search
         }
+        if field.no_search.is_present() {
+            return; // explicitly opted out
+        }
+        if is_excluded_type(&field.ty) {
+            return; // Auto<T> and ForeignKey<T> excluded
+        }
+
+        let name = field
+            .ident
+            .as_ref()
+            .expect("Only structs are supported")
+            .to_string();
+        self.search_fields.push(SearchField {
+            name,
+            needs_cast: !is_string_type(&field.ty),
+        });
     }
 
     #[expect(clippy::too_many_lines)] // it's mainly the AdminModel impl
@@ -79,6 +105,32 @@ impl AdminModelDeriveBuilder {
 
         let name = &self.name;
         let name_slug = name.to_string().to_snake_case();
+
+        let filter_exprs: Vec<TokenStream> = self
+            .search_fields
+            .iter()
+            .map(|f| {
+                let field_name = &f.name;
+                if f.needs_cast {
+                    quote! { Expr::like(Expr::lower(Expr::cast_as(Expr::field(#field_name), ::cot::db::query::CastType::Text)), __pat.clone()) }
+                } else {
+                    quote! { Expr::like(Expr::lower(Expr::field(#field_name)), __pat.clone()) }
+                }
+            })
+            .collect();
+
+        let search_block = if filter_exprs.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                if let Some(__s) = search {
+                    let __pat = ::std::format!("%{}%", __s.to_lowercase());
+                    if let Some(__filter) = [#(#filter_exprs),*].into_iter().reduce(Expr::or) {
+                        __q.filter(__filter);
+                    }
+                }
+            }
+        };
 
         let pk_name = if let Some(primary_key) = &self.primary_key {
             primary_key
@@ -99,21 +151,30 @@ impl AdminModelDeriveBuilder {
             impl #crate_ident::admin::AdminModel for #name {
                 async fn get_total_object_counts(
                     request: &#crate_ident::request::Request,
+                    search: ::core::option::Option<&str>,
                 ) -> #crate_ident::Result<u64> {
                     use #crate_ident::db::Model;
+                    use #crate_ident::db::query::Expr;
                     use #crate_ident::request::RequestExt;
 
-                    Ok(Self::objects().count(request.context().database()).await?)
+                    let mut __q = Self::objects();
+                    #search_block
+                    Ok(__q.count(request.context().database()).await?)
                 }
 
                 async fn get_objects(
                     request: &#crate_ident::request::Request,
                     pagination: #crate_ident::admin::Pagination,
+                    search: ::core::option::Option<&str>,
                 ) -> #crate_ident::Result<::std::vec::Vec<Self>> {
                     use #crate_ident::db::Model;
+                    use #crate_ident::db::query::Expr;
                     use #crate_ident::request::RequestExt;
 
-                    Ok(Self::objects().limit(pagination.limit()).offset(pagination.offset()).all(request.context().database()).await?)
+                    let mut __q = Self::objects();
+                    __q.limit(pagination.limit()).offset(pagination.offset());
+                    #search_block
+                    Ok(__q.all(request.context().database()).await?)
                 }
 
                 async fn get_object_by_id(
@@ -223,4 +284,46 @@ impl AdminModelDeriveBuilder {
             }
         }
     }
+}
+
+/// Returns true if `ty` is a string-like type that does not need a TEXT cast
+/// for LIKE comparisons: `String`, `LimitedString<N>`, `str`, and `Option<T>`
+/// where `T` is string-like.
+fn is_string_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) => {
+            let last = match type_path.path.segments.last() {
+                Some(seg) => seg,
+                None => return false,
+            };
+            let name = last.ident.to_string();
+            match name.as_str() {
+                "String" | "LimitedString" | "str" => true,
+                "Option" => {
+                    // unwrap Option<T> and check inner type
+                    if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
+                        if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                            return is_string_type(inner);
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            }
+        }
+        syn::Type::Reference(type_ref) => is_string_type(&type_ref.elem),
+        _ => false,
+    }
+}
+
+/// Returns true if `ty` is `Auto<T>` or `ForeignKey<T>`, which are excluded
+/// from search by default.
+fn is_excluded_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(last) = type_path.path.segments.last() {
+            let name = last.ident.to_string();
+            return name == "Auto" || name == "ForeignKey";
+        }
+    }
+    false
 }

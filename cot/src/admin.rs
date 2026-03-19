@@ -177,16 +177,17 @@ impl Pagination {
 }
 
 #[derive(Debug, Deserialize)]
-struct PaginationParams {
+struct ListParams {
     page: Option<u64>,
     page_size: Option<u64>,
+    search: Option<String>,
 }
 
 async fn view_model(
     base_context: BaseContext,
     managers: AdminModelManagers,
     Path(model_name): Path<String>,
-    UrlQuery(pagination_params): UrlQuery<PaginationParams>,
+    UrlQuery(params): UrlQuery<ListParams>,
     request: Request,
 ) -> crate::Result<Response> {
     #[derive(Debug, Template)]
@@ -201,16 +202,28 @@ async fn view_model(
         page_size: &'a u64,
         total_object_counts: u64,
         total_pages: u64,
+        search_query: &'a str,
     }
 
     const DEFAULT_PAGE_SIZE: u64 = 10;
 
     let manager = get_manager(managers, &model_name)?;
 
-    let page = pagination_params.page.unwrap_or(1);
-    let page_size = pagination_params.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+    let search_query = params
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    let search = if search_query.is_empty() {
+        None
+    } else {
+        Some(search_query)
+    };
 
-    let total_object_counts = manager.get_total_object_counts(&request).await?;
+    let total_object_counts = manager.get_total_object_counts(&request, search).await?;
     let total_pages = total_object_counts.div_ceil(page_size);
 
     if (page == 0 || page > total_pages) && total_pages > 0 {
@@ -221,7 +234,7 @@ async fn view_model(
 
     let pagination = Pagination::new(page_size, page);
 
-    let objects = manager.get_objects(&request, pagination).await?;
+    let objects = manager.get_objects(&request, pagination, search).await?;
 
     let template = ModelTemplate {
         ctx: &base_context,
@@ -231,6 +244,7 @@ async fn view_model(
         page_size: &page_size,
         total_object_counts,
         total_pages,
+        search_query: &search_query,
     };
 
     Html::new(template.render()?).into_response()
@@ -414,10 +428,15 @@ pub trait AdminModelManager: Send + Sync {
         &self,
         request: &Request,
         pagination: Pagination,
+        search: Option<&str>,
     ) -> cot::Result<Vec<Box<dyn AdminModel>>>;
 
     /// Returns the total count of objects of this model.
-    async fn get_total_object_counts(&self, request: &Request) -> cot::Result<u64>;
+    async fn get_total_object_counts(
+        &self,
+        request: &Request,
+        search: Option<&str>,
+    ) -> cot::Result<u64>;
 
     /// Returns the object with the given ID.
     async fn get_object_by_id(
@@ -493,22 +512,29 @@ impl<T: AdminModel + Send + Sync + 'static> AdminModelManager for DefaultAdminMo
         T::url_name()
     }
 
-    async fn get_total_object_counts(&self, request: &Request) -> cot::Result<u64> {
-        T::get_total_object_counts(request).await
+    async fn get_total_object_counts(
+        &self,
+        request: &Request,
+        search: Option<&str>,
+    ) -> cot::Result<u64> {
+        T::get_total_object_counts(request, search).await
     }
 
     async fn get_objects(
         &self,
         request: &Request,
         pagination: Pagination,
+        search: Option<&str>,
     ) -> cot::Result<Vec<Box<dyn AdminModel>>> {
         #[expect(trivial_casts)] // Upcast to the correct Box type
-        T::get_objects(request, pagination).await.map(|objects| {
-            objects
-                .into_iter()
-                .map(|object| Box::new(object) as Box<dyn AdminModel>)
-                .collect()
-        })
+        T::get_objects(request, pagination, search)
+            .await
+            .map(|objects| {
+                objects
+                    .into_iter()
+                    .map(|object| Box::new(object) as Box<dyn AdminModel>)
+                    .collect()
+            })
     }
 
     async fn get_object_by_id(
@@ -555,12 +581,16 @@ impl<T: AdminModel + Send + Sync + 'static> AdminModelManager for DefaultAdminMo
 )]
 pub trait AdminModel: Any + Send + 'static {
     /// Get the objects of this model.
-    async fn get_objects(request: &Request, pagination: Pagination) -> cot::Result<Vec<Self>>
+    async fn get_objects(
+        request: &Request,
+        pagination: Pagination,
+        search: Option<&str>,
+    ) -> cot::Result<Vec<Self>>
     where
         Self: Sized;
 
     /// Get the total count of objects of this model.
-    async fn get_total_object_counts(request: &Request) -> cot::Result<u64>
+    async fn get_total_object_counts(request: &Request, search: Option<&str>) -> cot::Result<u64>
     where
         Self: Sized;
 

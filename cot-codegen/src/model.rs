@@ -146,6 +146,7 @@ pub struct FieldOpts {
     pub ty: syn::Type,
     pub primary_key: darling::util::Flag,
     pub unique: darling::util::Flag,
+    pub no_search: darling::util::Flag,
 }
 
 impl FieldOpts {
@@ -516,6 +517,7 @@ mod tests {
             ty: parse_quote! { MyContainer<std::string::String> },
             primary_key: darling::util::Flag::default(),
             unique: darling::util::Flag::default(),
+            no_search: darling::util::Flag::default(),
         };
 
         assert!(opts.find_type("my_crate::MyContainer", &resolver).is_some());

@@ -148,8 +148,20 @@ h2 {
     justify-content: space-between;
 
     .action-box {
-        text-align: right;
+        display: flex;
+        align-items: center;
+        gap: .5rem;
         margin-bottom: 1rem;
+    }
+}
+
+.search-box {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+
+    input[type="text"] {
+        width: 16rem;
     }
 }
 

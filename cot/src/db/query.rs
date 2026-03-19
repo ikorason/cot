@@ -1,5 +1,6 @@
 //! Database query builder.
 
+use std::cell::Cell;
 use std::marker::PhantomData;
 
 use derive_more::with_trait::Debug;
@@ -201,7 +202,7 @@ impl<T: Model> Query<T> {
         select
             .from(T::TABLE_NAME)
             .expr(sea_query::Expr::col(sea_query::Asterisk).count());
-        self.add_filter_to_statement(&mut select);
+        self.add_filter_to_statement(&mut select, db.backend());
         let row = db.fetch_option(&select).await?;
         let count = match row {
             #[expect(clippy::cast_sign_loss)]
@@ -232,8 +233,10 @@ impl<T: Model> Query<T> {
     pub(super) fn add_filter_to_statement<S: sea_query::ConditionalStatement>(
         &self,
         statement: &mut S,
+        backend: DbBackend,
     ) {
         if let Some(filter) = &self.filter {
+            DbBackend::set_current(backend);
             statement.and_where(filter.as_sea_query_expr());
         }
     }
@@ -276,6 +279,57 @@ impl<T: Model> Query<T> {
 ///     query!(MyModel, $id == 5)
 /// );
 /// ```
+/// The database backend being used to execute a query.
+///
+/// Used to resolve backend-specific SQL expressions (e.g. [`CastType::Text`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DbBackend {
+    /// SQLite backend.
+    #[default]
+    Sqlite,
+    /// PostgreSQL backend.
+    Postgres,
+    /// MySQL backend.
+    MySql,
+}
+
+thread_local! {
+    static CURRENT_BACKEND: Cell<DbBackend> = const { Cell::new(DbBackend::Sqlite) };
+}
+
+impl DbBackend {
+    pub(super) fn current() -> Self {
+        CURRENT_BACKEND.with(|b| b.get())
+    }
+
+    pub(super) fn set_current(backend: Self) {
+        CURRENT_BACKEND.with(|b| b.set(backend));
+    }
+}
+
+/// The target SQL type for a [`Expr::CastAs`] expression.
+///
+/// Each variant resolves to the appropriate SQL type name per database backend,
+/// ensuring cross-database compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastType {
+    /// Cast to a text string.
+    ///
+    /// Resolves to `TEXT` on SQLite and PostgreSQL, and `CHAR` on MySQL.
+    Text,
+}
+
+impl CastType {
+    fn sql_type(&self, backend: DbBackend) -> &'static str {
+        match self {
+            Self::Text => match backend {
+                DbBackend::MySql => "CHAR",
+                DbBackend::Sqlite | DbBackend::Postgres => "TEXT",
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Expr {
@@ -595,6 +649,42 @@ pub enum Expr {
     /// );
     /// ```
     Div(Box<Expr>, Box<Expr>),
+    /// A `field LIKE pattern` expression.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::Expr;
+    ///
+    /// let expr = Expr::like(Expr::field("name"), "%alice%");
+    /// ```
+    Like(Box<Expr>, String),
+    /// A `LOWER(expr)` expression.
+    ///
+    /// Wraps the inner expression in `LOWER()`, enabling case-insensitive
+    /// comparisons when combined with [`Expr::like`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::Expr;
+    ///
+    /// let expr = Expr::like(Expr::lower(Expr::field("name")), "%alice%");
+    /// ```
+    Lower(Box<Expr>),
+    /// A `CAST(expr AS type)` expression.
+    ///
+    /// Casts the inner expression to the SQL type specified by [`CastType`],
+    /// which resolves to the correct type name per database backend.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::{CastType, Expr};
+    ///
+    /// let expr = Expr::like(Expr::lower(Expr::cast_as(Expr::field("score"), CastType::Text)), "%42%");
+    /// ```
+    CastAs(Box<Expr>, CastType),
 }
 
 impl Expr {
@@ -984,6 +1074,56 @@ impl Expr {
         Self::Div(Box::new(lhs), Box::new(rhs))
     }
 
+    /// Create a new `LIKE` expression.
+    ///
+    /// The `pattern` should include `%` wildcards. For case-insensitive search,
+    /// wrap the field with [`Expr::lower`] and lowercase the pattern yourself.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::Expr;
+    ///
+    /// let expr = Expr::like(Expr::field("name"), "%alice%");
+    /// ```
+    #[must_use]
+    pub fn like(lhs: Self, pattern: impl Into<String>) -> Self {
+        Self::Like(Box::new(lhs), pattern.into())
+    }
+
+    /// Create a new `LOWER(expr)` expression.
+    ///
+    /// Wraps the inner expression in SQL `LOWER()`. Combine with [`Expr::like`]
+    /// and a lowercased pattern for cross-database case-insensitive search.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::Expr;
+    ///
+    /// let expr = Expr::lower(Expr::field("name"));
+    /// ```
+    #[must_use]
+    pub fn lower(expr: Self) -> Self {
+        Self::Lower(Box::new(expr))
+    }
+
+    /// Create a new `CAST(expr AS type)` expression.
+    ///
+    /// The SQL type is resolved per database backend via [`CastType`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::{CastType, Expr};
+    ///
+    /// let expr = Expr::cast_as(Expr::field("score"), CastType::Text);
+    /// ```
+    #[must_use]
+    pub fn cast_as(expr: Self, cast_type: CastType) -> Self {
+        Self::CastAs(Box::new(expr), cast_type)
+    }
+
     /// Returns the expression as a [`sea_query::SimpleExpr`].
     ///
     /// # Example
@@ -1020,6 +1160,15 @@ impl Expr {
             Self::Sub(lhs, rhs) => lhs.as_sea_query_expr().sub(rhs.as_sea_query_expr()),
             Self::Mul(lhs, rhs) => lhs.as_sea_query_expr().mul(rhs.as_sea_query_expr()),
             Self::Div(lhs, rhs) => lhs.as_sea_query_expr().div(rhs.as_sea_query_expr()),
+            Self::Like(lhs, rhs) => lhs.as_sea_query_expr().like(rhs.as_str()),
+            Self::Lower(expr) => sea_query::Func::lower(expr.as_sea_query_expr()).into(),
+            Self::CastAs(expr, cast_type) => {
+                sea_query::Func::cast_as(
+                    expr.as_sea_query_expr(),
+                    sea_query::Alias::new(cast_type.sql_type(DbBackend::current())),
+                )
+                .into()
+            }
         }
     }
 }
@@ -1571,4 +1720,32 @@ mod tests {
     test_expr_constructor!(expr_sub, Sub, sub);
     test_expr_constructor!(expr_mul, Mul, mul);
     test_expr_constructor!(expr_div, Div, div);
+
+    #[test]
+    fn expr_like() {
+        let expr = Expr::like(Expr::field("name"), "alice%");
+        if let Expr::Like(field, pattern) = expr {
+            assert!(matches!(*field, Expr::Field(_)));
+            assert_eq!(pattern, "alice%");
+        } else {
+            panic!("Expected Expr::Like");
+        }
+    }
+
+    #[test]
+    fn expr_lower() {
+        let expr = Expr::lower(Expr::field("name"));
+        assert!(matches!(expr, Expr::Lower(_)));
+    }
+
+    #[test]
+    fn expr_cast_as() {
+        let expr = Expr::cast_as(Expr::field("score"), CastType::Text);
+        if let Expr::CastAs(inner, cast_type) = expr {
+            assert!(matches!(*inner, Expr::Field(_)));
+            assert_eq!(cast_type, CastType::Text);
+        } else {
+            panic!("Expected Expr::CastAs");
+        }
+    }
 }
