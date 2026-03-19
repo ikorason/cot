@@ -38,6 +38,7 @@ pub struct DatabaseUser {
     id: Auto<i64>,
     #[model(unique)]
     username: LimitedString<MAX_USERNAME_LENGTH>,
+    #[model(no_search)]
     password: PasswordHash,
 }
 

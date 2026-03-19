@@ -201,7 +201,7 @@ impl<T: Model> Query<T> {
         select
             .from(T::TABLE_NAME)
             .expr(sea_query::Expr::col(sea_query::Asterisk).count());
-        self.add_filter_to_statement(&mut select);
+        self.add_filter_to_statement(&mut select, db.backend());
         let row = db.fetch_option(&select).await?;
         let count = match row {
             #[expect(clippy::cast_sign_loss)]
@@ -232,9 +232,10 @@ impl<T: Model> Query<T> {
     pub(super) fn add_filter_to_statement<S: sea_query::ConditionalStatement>(
         &self,
         statement: &mut S,
+        backend: DbBackend,
     ) {
         if let Some(filter) = &self.filter {
-            statement.and_where(filter.as_sea_query_expr());
+            statement.and_where(filter.as_sea_query_expr(backend));
         }
     }
 
@@ -247,6 +248,43 @@ impl<T: Model> Query<T> {
     pub(super) fn add_offset_to_statement(&self, statement: &mut sea_query::SelectStatement) {
         if let Some(offset) = self.offset {
             statement.offset(offset);
+        }
+    }
+}
+
+/// The database backend being used to execute a query.
+///
+/// Used to resolve backend-specific SQL expressions (e.g. [`CastType::Text`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DbBackend {
+    /// SQLite backend.
+    #[default]
+    Sqlite,
+    /// PostgreSQL backend.
+    Postgres,
+    /// MySQL backend.
+    MySql,
+}
+
+/// The target SQL type for a [`Expr::CastAs`] expression.
+///
+/// Each variant resolves to the appropriate SQL type name per database backend,
+/// ensuring cross-database compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastType {
+    /// Cast to a text string.
+    ///
+    /// Resolves to `TEXT` on SQLite and PostgreSQL, and `CHAR` on MySQL.
+    Text,
+}
+
+impl CastType {
+    fn sql_type(&self, backend: DbBackend) -> &'static str {
+        match self {
+            Self::Text => match backend {
+                DbBackend::MySql => "CHAR",
+                DbBackend::Sqlite | DbBackend::Postgres => "TEXT",
+            },
         }
     }
 }
@@ -595,6 +633,42 @@ pub enum Expr {
     /// );
     /// ```
     Div(Box<Expr>, Box<Expr>),
+    /// A `field LIKE pattern` expression.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::Expr;
+    ///
+    /// let expr = Expr::like(Expr::field("name"), "%alice%");
+    /// ```
+    Like(Box<Expr>, String, Option<char>),
+    /// A `LOWER(expr)` expression.
+    ///
+    /// Wraps the inner expression in `LOWER()`, enabling case-insensitive
+    /// comparisons when combined with [`Expr::like`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::Expr;
+    ///
+    /// let expr = Expr::like(Expr::lower(Expr::field("name")), "%alice%");
+    /// ```
+    Lower(Box<Expr>),
+    /// A `CAST(expr AS type)` expression.
+    ///
+    /// Casts the inner expression to the SQL type specified by [`CastType`],
+    /// which resolves to the correct type name per database backend.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::{CastType, Expr};
+    ///
+    /// let expr = Expr::like(Expr::lower(Expr::cast_as(Expr::field("score"), CastType::Text)), "%42%");
+    /// ```
+    CastAs(Box<Expr>, CastType),
 }
 
 impl Expr {
@@ -984,19 +1058,89 @@ impl Expr {
         Self::Div(Box::new(lhs), Box::new(rhs))
     }
 
+    /// Create a new `LIKE` expression.
+    ///
+    /// The `pattern` should include `%` wildcards. For case-insensitive search,
+    /// wrap the field with [`Expr::lower`] and lowercase the pattern yourself.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::Expr;
+    ///
+    /// let expr = Expr::like(Expr::field("name"), "%alice%");
+    /// ```
+    #[must_use]
+    pub fn like(lhs: Self, pattern: impl Into<String>) -> Self {
+        Self::Like(Box::new(lhs), pattern.into(), None)
+    }
+
+    /// Create a new `LIKE` expression with an `ESCAPE` clause.
+    ///
+    /// The escape character is used to treat `%` and `_` as literals when
+    /// they are preceded by it in the pattern. This prevents user input
+    /// containing wildcard characters from being interpreted as LIKE
+    /// metacharacters.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::Expr;
+    ///
+    /// // Search for literal "100%" by escaping the wildcard
+    /// let expr = Expr::like_escape(Expr::field("name"), "%100\\%%", '\\');
+    /// ```
+    #[must_use]
+    pub fn like_escape(lhs: Self, pattern: impl Into<String>, escape: char) -> Self {
+        Self::Like(Box::new(lhs), pattern.into(), Some(escape))
+    }
+
+    /// Create a new `LOWER(expr)` expression.
+    ///
+    /// Wraps the inner expression in SQL `LOWER()`. Combine with [`Expr::like`]
+    /// and a lowercased pattern for cross-database case-insensitive search.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::Expr;
+    ///
+    /// let expr = Expr::lower(Expr::field("name"));
+    /// ```
+    #[must_use]
+    pub fn lower(expr: Self) -> Self {
+        Self::Lower(Box::new(expr))
+    }
+
+    /// Create a new `CAST(expr AS type)` expression.
+    ///
+    /// The SQL type is resolved per database backend via [`CastType`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cot::db::query::{CastType, Expr};
+    ///
+    /// let expr = Expr::cast_as(Expr::field("score"), CastType::Text);
+    /// ```
+    #[must_use]
+    pub fn cast_as(expr: Self, cast_type: CastType) -> Self {
+        Self::CastAs(Box::new(expr), cast_type)
+    }
+
     /// Returns the expression as a [`sea_query::SimpleExpr`].
     ///
     /// # Example
     ///
     /// ```
     /// use cot::db::Identifier;
-    /// use cot::db::query::Expr;
+    /// use cot::db::query::{DbBackend, Expr};
     /// use sea_query::IntoColumnRef;
     ///
     /// let expr = Expr::eq(Expr::field("id"), Expr::value(5));
     ///
     /// assert_eq!(
-    ///     expr.as_sea_query_expr(),
+    ///     expr.as_sea_query_expr(DbBackend::Sqlite),
     ///     sea_query::SimpleExpr::eq(
     ///         sea_query::SimpleExpr::Column(Identifier::new("id").into_column_ref()),
     ///         sea_query::SimpleExpr::Value(sea_query::Value::Int(Some(5)))
@@ -1004,22 +1148,38 @@ impl Expr {
     /// );
     /// ```
     #[must_use]
-    pub fn as_sea_query_expr(&self) -> sea_query::SimpleExpr {
+    pub fn as_sea_query_expr(&self, backend: DbBackend) -> sea_query::SimpleExpr {
         match self {
             Self::Field(identifier) => (*identifier).into_column_ref().into(),
             Self::Value(value) => (*value).clone().into(),
-            Self::And(lhs, rhs) => lhs.as_sea_query_expr().and(rhs.as_sea_query_expr()),
-            Self::Or(lhs, rhs) => lhs.as_sea_query_expr().or(rhs.as_sea_query_expr()),
-            Self::Eq(lhs, rhs) => lhs.as_sea_query_expr().eq(rhs.as_sea_query_expr()),
-            Self::Ne(lhs, rhs) => lhs.as_sea_query_expr().ne(rhs.as_sea_query_expr()),
-            Self::Lt(lhs, rhs) => lhs.as_sea_query_expr().lt(rhs.as_sea_query_expr()),
-            Self::Lte(lhs, rhs) => lhs.as_sea_query_expr().lte(rhs.as_sea_query_expr()),
-            Self::Gt(lhs, rhs) => lhs.as_sea_query_expr().gt(rhs.as_sea_query_expr()),
-            Self::Gte(lhs, rhs) => lhs.as_sea_query_expr().gte(rhs.as_sea_query_expr()),
-            Self::Add(lhs, rhs) => lhs.as_sea_query_expr().add(rhs.as_sea_query_expr()),
-            Self::Sub(lhs, rhs) => lhs.as_sea_query_expr().sub(rhs.as_sea_query_expr()),
-            Self::Mul(lhs, rhs) => lhs.as_sea_query_expr().mul(rhs.as_sea_query_expr()),
-            Self::Div(lhs, rhs) => lhs.as_sea_query_expr().div(rhs.as_sea_query_expr()),
+            Self::And(lhs, rhs) => lhs.as_sea_query_expr(backend).and(rhs.as_sea_query_expr(backend)),
+            Self::Or(lhs, rhs) => lhs.as_sea_query_expr(backend).or(rhs.as_sea_query_expr(backend)),
+            Self::Eq(lhs, rhs) => lhs.as_sea_query_expr(backend).eq(rhs.as_sea_query_expr(backend)),
+            Self::Ne(lhs, rhs) => lhs.as_sea_query_expr(backend).ne(rhs.as_sea_query_expr(backend)),
+            Self::Lt(lhs, rhs) => lhs.as_sea_query_expr(backend).lt(rhs.as_sea_query_expr(backend)),
+            Self::Lte(lhs, rhs) => lhs.as_sea_query_expr(backend).lte(rhs.as_sea_query_expr(backend)),
+            Self::Gt(lhs, rhs) => lhs.as_sea_query_expr(backend).gt(rhs.as_sea_query_expr(backend)),
+            Self::Gte(lhs, rhs) => lhs.as_sea_query_expr(backend).gte(rhs.as_sea_query_expr(backend)),
+            Self::Add(lhs, rhs) => lhs.as_sea_query_expr(backend).add(rhs.as_sea_query_expr(backend)),
+            Self::Sub(lhs, rhs) => lhs.as_sea_query_expr(backend).sub(rhs.as_sea_query_expr(backend)),
+            Self::Mul(lhs, rhs) => lhs.as_sea_query_expr(backend).mul(rhs.as_sea_query_expr(backend)),
+            Self::Div(lhs, rhs) => lhs.as_sea_query_expr(backend).div(rhs.as_sea_query_expr(backend)),
+            Self::Like(lhs, rhs, escape) => {
+                let like_expr = sea_query::LikeExpr::new(rhs.as_str());
+                let like_expr = match escape {
+                    Some(c) => like_expr.escape(*c),
+                    None => like_expr,
+                };
+                lhs.as_sea_query_expr(backend).like(like_expr)
+            }
+            Self::Lower(expr) => sea_query::Func::lower(expr.as_sea_query_expr(backend)).into(),
+            Self::CastAs(expr, cast_type) => {
+                sea_query::Func::cast_as(
+                    expr.as_sea_query_expr(backend),
+                    sea_query::Alias::new(cast_type.sql_type(backend)),
+                )
+                .into()
+            }
         }
     }
 }
@@ -1571,4 +1731,45 @@ mod tests {
     test_expr_constructor!(expr_sub, Sub, sub);
     test_expr_constructor!(expr_mul, Mul, mul);
     test_expr_constructor!(expr_div, Div, div);
+
+    #[test]
+    fn expr_like() {
+        let expr = Expr::like(Expr::field("name"), "alice%");
+        if let Expr::Like(field, pattern, escape) = expr {
+            assert!(matches!(*field, Expr::Field(_)));
+            assert_eq!(pattern, "alice%");
+            assert_eq!(escape, None);
+        } else {
+            panic!("Expected Expr::Like");
+        }
+    }
+
+    #[test]
+    fn expr_like_escape() {
+        let expr = Expr::like_escape(Expr::field("name"), "%100\\%%", '\\');
+        if let Expr::Like(field, pattern, escape) = expr {
+            assert!(matches!(*field, Expr::Field(_)));
+            assert_eq!(pattern, "%100\\%%");
+            assert_eq!(escape, Some('\\'));
+        } else {
+            panic!("Expected Expr::Like");
+        }
+    }
+
+    #[test]
+    fn expr_lower() {
+        let expr = Expr::lower(Expr::field("name"));
+        assert!(matches!(expr, Expr::Lower(_)));
+    }
+
+    #[test]
+    fn expr_cast_as() {
+        let expr = Expr::cast_as(Expr::field("score"), CastType::Text);
+        if let Expr::CastAs(inner, cast_type) = expr {
+            assert!(matches!(*inner, Expr::Field(_)));
+            assert_eq!(cast_type, CastType::Text);
+        } else {
+            panic!("Expected Expr::CastAs");
+        }
+    }
 }
